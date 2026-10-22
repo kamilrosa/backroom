@@ -1,0 +1,6 @@
+/target
+.env
+/data
+*.wav
+/dist
+.DS_Store

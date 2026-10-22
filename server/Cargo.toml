@@ -1,0 +1,19 @@
+[package]
+name = "backroom-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backroom voice chat server (single-room QUIC relay)"
+
+[dependencies]
+backroom-proto = { path = "../proto" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"

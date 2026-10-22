@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["proto", "server", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# DeepFilterNet and Opus must be optimized even in dev builds,
+# otherwise they cannot keep up in real time.
+[profile.dev.package."*"]
+opt-level = 3
