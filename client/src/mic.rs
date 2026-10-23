@@ -6,13 +6,20 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use backroom_proto::{FLAG_END, FLAG_START, FRAME_SAMPLES};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::dsp::{self, Agc, Denoiser, EnergySnr, Gate, GateEvent, HOP};
 use crate::state::{MicTest, Shared};
 
 /// Pre-roll: 40 ms from before the gate decision, so word onsets are not clipped.
 const PREROLL_FRAMES: usize = 2;
+/// The gate already holds 400 ms after speech; reopening sooner than this
+/// after closing means it most likely cut a sentence in half — logged.
+const SHORT_CLOSE_FRAMES: u32 = 15;
+/// Hysteresis: once the gate is open, the speech threshold drops by this much.
+/// Measured with mic_eval on speech under loud barking (together with the
+/// 400 ms hangover): 99% of speech sent instead of 93%.
+const HOLD_MARGIN_DB: f32 = 5.0;
 
 pub struct Packet {
     pub flags: u8,
@@ -30,6 +37,11 @@ pub struct MicChain {
     frame: [f32; FRAME_SAMPLES],
     half: usize,
     frame_snr: f32,
+    /// Frames since the gate opened / closed (for the log).
+    open_frames: u32,
+    closed_frames: u32,
+    /// Frames inside the utterance that were not speech (bridged by the hangover).
+    dips: u32,
 }
 
 impl Default for MicChain {
@@ -57,6 +69,9 @@ impl MicChain {
             frame: [0.0; FRAME_SAMPLES],
             half: 0,
             frame_snr: f32::MIN,
+            open_frames: 0,
+            closed_frames: u32::MAX,
+            dips: 0,
         }
     }
 
@@ -92,7 +107,13 @@ impl MicChain {
 
     fn process_frame(&mut self, shared: &Shared, snr: f32, out: &mut Vec<Packet>) {
         let level = dsp::rms_db(&self.frame);
-        let speech = dsp::is_speech(snr, level, shared.vad_threshold.get());
+        // Hysteresis: opening takes the full threshold, staying open a lower one,
+        // so quieter syllables inside a sentence do not close the gate.
+        let mut threshold = shared.vad_threshold.get();
+        if self.gate.is_open() {
+            threshold -= HOLD_MARGIN_DB;
+        }
+        let speech = dsp::is_speech(snr, level, threshold);
         self.agc.process(&mut self.frame, speech);
         shared.mic_level_db.set(dsp::rms_db(&self.frame));
 
@@ -110,6 +131,7 @@ impl MicChain {
         // The encoder runs all the time so the pre-roll has packets ready.
         let Ok(n) = self.opus.encode_float(&self.frame, &mut self.buf) else { return };
         let pkt = self.buf[..n].to_vec();
+        self.log_gate(event, active, snr);
         match event {
             GateEvent::Closed => {
                 self.preroll.push_back(pkt);
@@ -126,6 +148,32 @@ impl MicChain {
             }
             GateEvent::Open => out.push(Packet { flags: 0, data: pkt }),
             GateEvent::Closing => out.push(Packet { flags: FLAG_END, data: pkt }),
+        }
+    }
+
+    fn log_gate(&mut self, event: GateEvent, active: bool, snr: f32) {
+        match event {
+            GateEvent::Opened => {
+                let closed_ms = self.closed_frames.saturating_mul(20);
+                if self.closed_frames < SHORT_CLOSE_FRAMES {
+                    info!("Microphone: gate reopened after only {closed_ms} ms (SNR {snr:.0} dB)");
+                } else {
+                    debug!("Microphone: gate opened (SNR {snr:.0} dB)");
+                }
+                self.open_frames = 1;
+                self.dips = 0;
+            }
+            GateEvent::Open => {
+                self.open_frames += 1;
+                self.dips += !active as u32;
+            }
+            GateEvent::Closing => {
+                // The last HANG frames are the hangover after speech, not dips.
+                let dips = self.dips.saturating_sub(dsp::HANG - 1);
+                debug!("Microphone: gate closed after {} ms, {dips} non-speech frames inside", self.open_frames * 20);
+                self.closed_frames = 0;
+            }
+            GateEvent::Closed => self.closed_frames = self.closed_frames.saturating_add(1),
         }
     }
 

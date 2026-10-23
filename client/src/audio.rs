@@ -15,10 +15,10 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 use crossbeam_channel::{Receiver, Sender};
 use backroom_proto::{self as proto, UserId, FRAME_SAMPLES};
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::dsp::{self, Framer, Resampler, HOP};
-use crate::jitter::JitterBuffer;
+use crate::jitter::{JitterBuffer, Stats};
 use crate::mic::{MicChain, Packet};
 use crate::state::{MicTest, Shared, MIC_TEST_LEN};
 
@@ -39,6 +39,9 @@ const RETRY_OPEN_EVERY: Duration = Duration::from_secs(1);
 /// This much digital silence (all zeros) = microphone muted/blocked.
 const DIGITAL_SILENCE: Duration = Duration::from_secs(3);
 const SILENCE_RESTART_EVERY: Duration = Duration::from_secs(15);
+/// A pause this short between two utterances of one person is probably a cut
+/// in the middle of a sentence (the sender's gate closed), so it is logged.
+const SHORT_GAP: Duration = Duration::from_millis(300);
 
 fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -519,6 +522,51 @@ pub fn spawn_playback(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Rece
 struct Peer {
     jb: JitterBuffer,
     last_packet: Instant,
+    /// Start of the utterance being played and the stats at that moment.
+    talk: Option<(Instant, Stats)>,
+    idle_since: Option<Instant>,
+}
+
+impl Peer {
+    fn new(now: Instant) -> Self {
+        Self { jb: JitterBuffer::new(), last_packet: now, talk: None, idle_since: None }
+    }
+
+    /// Logs utterance boundaries, short gaps and losses — the data needed
+    /// when someone reports that a voice cuts out.
+    fn track(&mut self, id: UserId, shared: &Shared, now: Instant) {
+        let playing = self.jb.is_playing();
+        let name = || shared.status.lock().users.get(&id).map_or_else(|| format!("#{id}"), |u| u.info.name.clone());
+        match (self.talk, playing) {
+            (None, true) => {
+                if let Some(gap) = self.idle_since.take().map(|t| now - t) {
+                    if gap < SHORT_GAP {
+                        info!("Voice from {}: resumed after only {} ms", name(), gap.as_millis());
+                    }
+                }
+                self.talk = Some((now, self.jb.stats));
+            }
+            (Some((start, s0)), false) => {
+                let s = self.jb.stats;
+                let (plc, fec, late, skipped) =
+                    (s.plc - s0.plc, s.fec - s0.fec, s.late - s0.late, s.dropped_for_latency - s0.dropped_for_latency);
+                let msg = format!(
+                    "Voice from {}: {:.1} s, concealed {plc} (FEC {fec}), late {late}, skipped {skipped}, underruns {}",
+                    name(),
+                    (now - start).as_secs_f32(),
+                    s.underruns - s0.underruns
+                );
+                if plc + fec + late + skipped > 0 {
+                    info!("{msg}");
+                } else {
+                    debug!("{msg}");
+                }
+                self.talk = None;
+                self.idle_since = Some(now);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receiver<Vec<f32>>) {
@@ -562,7 +610,7 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
             if deafened {
                 continue;
             }
-            let peer = peers.entry(p.sender).or_insert_with(|| Peer { jb: JitterBuffer::new(), last_packet: now });
+            let peer = peers.entry(p.sender).or_insert_with(|| Peer::new(now));
             peer.last_packet = now;
             peer.jb.push(p.seq, p.flags, &p.data, now);
         }
@@ -600,6 +648,7 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
                             *m += s * g;
                         }
                     }
+                    peer.track(*id, &shared, now);
                 }
                 for m in mix.iter_mut() {
                     *m = dsp::soft_clip(*m);

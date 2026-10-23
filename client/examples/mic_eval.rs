@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 fn read(p: &str) -> Vec<f32> {
     let r = hound::WavReader::open(p).unwrap_or_else(|e| panic!("{p}: {e}"));
-    assert_eq!(r.spec().sample_rate, 48_000, "{p}: wymagane 48 kHz");
+    assert_eq!(r.spec().sample_rate, 48_000, "{p}: 48 kHz required");
     r.into_samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect()
 }
 
@@ -92,6 +92,22 @@ fn main() {
                 sil_sent += sent_frames[f] as u32;
             }
         }
+        // Cuts: gaps in transmission inside an utterance (sent before and after, within 1 s).
+        let (mut cuts, mut cut_ms, mut run) = (0u32, 0u32, 0u32);
+        let mut seen_sent = false;
+        for f in 0..frames {
+            if sent_frames[f] {
+                if seen_sent && run > 0 && run < 50 {
+                    cuts += 1;
+                    cut_ms += run * 20;
+                }
+                seen_sent = true;
+                run = 0;
+            } else {
+                run += 1;
+            }
+        }
+        println!("  gaps under 1 s inside speech: {cuts} ({cut_ms} ms in total)");
         let pct = |a: u32, b: u32| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
         println!(
             "{label} | speech sent: {:5.1}% ({sp}) | noise-only sent: {:5.1}% ({nz}) | silence sent: {:5.1}% ({sil}) | CPU {:.1}% of a core",

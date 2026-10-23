@@ -66,9 +66,14 @@ impl JitterBuffer {
         self.stats.received += 1;
         if flags & FLAG_START != 0 {
             if let Some(n) = self.next {
-                // A new utterance while we are still playing the old one (e.g. a
-                // lost END packet) — drop the leftovers to avoid adding delay.
-                if seq >= n + self.target as u32 || seq < n {
+                // A new utterance while the old one is still playing. Sequence
+                // numbers run on across utterances, so when it directly follows
+                // what is buffered (the sender's gate reopened a moment after
+                // closing) it simply continues the stream. Start over only when
+                // the sender restarted (the number went back) or packets in
+                // between went missing (e.g. a lost END).
+                let expected = self.packets.keys().next_back().map_or(n, |&last| last + 1).max(n);
+                if seq < n || seq > expected {
                     self.reset();
                 }
             }
@@ -86,6 +91,20 @@ impl JitterBuffer {
         while self.packets.len() > MAX_PACKETS {
             self.packets.pop_first();
         }
+    }
+
+    /// Whether an utterance is being played (between its start and end).
+    pub fn is_playing(&self) -> bool {
+        self.next.is_some()
+    }
+
+    /// End of an utterance: go idle, but keep packets that already arrived
+    /// (the start of the next utterance) — they get fresh headroom.
+    fn finish_utterance(&mut self, now: Instant) {
+        self.next = None;
+        self.concealed_run = 0;
+        self.first_arrival = (!self.packets.is_empty()).then_some(now);
+        let _ = self.decoder.reset_state();
     }
 
     fn reset(&mut self) {
@@ -144,7 +163,12 @@ impl JitterBuffer {
         }
         self.next = Some(n + 1);
 
-        if end || (self.concealed_run >= MAX_CONCEAL && self.packets.is_empty()) {
+        if end {
+            // The next utterance may already be waiting — do not throw it away.
+            if !self.packets.contains_key(&(n + 1)) {
+                self.finish_utterance(now);
+            }
+        } else if self.concealed_run >= MAX_CONCEAL && self.packets.is_empty() {
             self.reset();
         } else if self.concealed_run >= MAX_CONCEAL {
             // Long gap, but later packets exist — jump to the nearest one.
@@ -316,6 +340,39 @@ mod tests {
         jb.pop(&mut out, t0);
         assert!(jb.packets.len() <= jb.target, "{} packets left", jb.packets.len());
         assert!(jb.stats.dropped_for_latency > 20);
+    }
+
+    /// The sender's gate closes and reopens a moment later: the new utterance
+    /// arrives while the end of the old one is still buffered. Nothing may be lost.
+    #[test]
+    fn quick_reopen_keeps_both_utterances() {
+        let pk = tone_packets(40);
+        for closed in 0..6u32 {
+            let mut jb = JitterBuffer::new();
+            let mut now = Instant::now();
+            let mut out = [0f32; FRAME_SAMPLES];
+            // Packets per 20 ms tick: A = 1..=10 (END on 10), then `closed` silent
+            // ticks, then B starts with the 2 pre-roll frames sent at once.
+            let mut ticks: Vec<Vec<(u32, u8)>> = (1..=10).map(|s| vec![(s, if s == 1 { FLAG_START } else if s == 10 { FLAG_END } else { 0 })]).collect();
+            ticks.extend((0..closed).map(|_| vec![]));
+            ticks.push(vec![(11, FLAG_START), (12, 0), (13, 0)]);
+            ticks.extend((14..=20).map(|s| vec![(s, if s == 20 { FLAG_END } else { 0 })]));
+            ticks.extend((0..10).map(|_| vec![]));
+            let mut played = 0;
+            for t in ticks {
+                for (s, f) in t {
+                    jb.push(s, f, &pk[s as usize], now);
+                }
+                played += jb.pop(&mut out, now) as u32;
+                now += FRAME;
+            }
+            assert_eq!(
+                (played, jb.stats.plc, jb.stats.dropped_for_latency),
+                (20, 0, 0),
+                "gate closed for {closed} frames: {:?}",
+                jb.stats
+            );
+        }
     }
 
     #[test]

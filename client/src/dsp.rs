@@ -185,8 +185,9 @@ pub struct Gate {
     hang_left: u32,
 }
 
-/// 300 ms hangover after speech ends (does not clip word endings).
-const HANG: u32 = 15;
+/// 400 ms hangover after speech ends: does not clip word endings and bridges
+/// short pauses inside a sentence.
+pub const HANG: u32 = 20;
 /// Anything quieter never opens the gate, even with a high SNR.
 const MIN_LEVEL_DB: f32 = -55.0;
 

@@ -143,8 +143,17 @@ others ─► adaptive jitter buffer (FEC/PLC on loss) ─► mix ─► watchdo
 
 **Speech gate.** It decides from the SNR that DeepFilterNet returns (speech about +20…+35 dB, barking about
 −15…−3 dB), not from loudness. The threshold depends on the sensitivity: 15 / 8 / 3 dB. After the last
-speech frame the gate stays open for another 300 ms; when it opens, the previous 40 ms are sent as well so
-word onsets are not clipped.
+speech frame the gate stays open for another 400 ms, and while it is open the threshold is 5 dB lower
+(hysteresis), so quieter syllables and short pauses do not cut a sentence in half. When it opens, the
+previous 40 ms are sent as well so word onsets are not clipped.
+
+**Jitter buffer.** Sequence numbers run on across utterances. When the gate reopens a moment after
+closing, the new utterance arrives while the end of the old one is still buffered; it is played straight
+after it instead of being dropped.
+
+**Diagnostics.** The client log records every utterance received with losses, late or skipped frames and
+suspiciously short gaps, plus the microphone gate reopening shortly after closing. With
+`RUST_LOG=info,backroom_client=debug` it also logs every gate decision and every clean utterance.
 
 **Mic test.** Records 5 s of the packets that would be sent, decodes them and plays them back. Nothing is
 transmitted during recording or playback, so there is no feedback loop even on speakers.
