@@ -12,13 +12,15 @@ mkdir -p dist
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/src:ro -v "$PWD/dist":/dist \
   -v backroom-linux-x64-target:/target -v backroom-linux-x64-cargo:/root/.cargo \
+  -v backroom-linux-x64-rustup:/root/.rustup \
   -w /src -e CARGO_TARGET_DIR=/target ubuntu:22.04 sh -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive PATH=/root/.cargo/bin:$PATH
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates build-essential cmake pkg-config \
       libasound2-dev libx11-dev libxi-dev libxtst-dev >/dev/null
-    command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    # The cargo shim can be cached without a toolchain — check that it really runs.
+    cargo --version >/dev/null 2>&1 || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
     cargo build --release -p backroom
     tar -czf /dist/backroom-linux-x64.tar.gz -C /target/release backroom
   '
