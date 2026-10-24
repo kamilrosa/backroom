@@ -4,6 +4,7 @@
 //! keep running while the client reconnects by itself (1 s, 2 s, 4 s, then every 5 s).
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,8 @@ pub struct Target {
 pub enum Command {
     Connect(Target),
     Disconnect,
-    SetState { muted: bool, deafened: bool },
+    SetState { muted: bool, deafened: bool, away: bool },
+    Chat(String),
 }
 
 pub struct NetHandle {
@@ -114,6 +116,7 @@ async fn manager(
         io.shared.update(|s| {
             s.users.clear();
             s.my_id = None;
+            s.chat_available = false;
         });
         match end {
             End::UserDisconnect => {
@@ -154,7 +157,7 @@ async fn manager(
                                 target = Some(nt);
                                 break;
                             }
-                            Some(Command::SetState { .. }) => {}
+                            Some(Command::SetState { .. } | Command::Chat(_)) => {}
                         },
                         _ = io.voice_rx.recv() => {}
                     }
@@ -224,7 +227,8 @@ async fn run_once(t: &Target, io: &mut Io) -> End {
     }
 }
 
-async fn connect(addr: SocketAddr, expected: Option<String>, seen: Arc<Mutex<Option<String>>>) -> Result<quinn::Connection> {
+/// A bare QUIC connection to the server (also used by tests to pose as an older client).
+pub async fn connect(addr: SocketAddr, expected: Option<String>, seen: Arc<Mutex<Option<String>>>) -> Result<quinn::Connection> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(Tofu { expected, seen, provider: provider.clone() });
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -266,7 +270,18 @@ fn spawn_reader(recv: quinn::RecvStream) -> mpsc::Receiver<Result<ServerMsg>> {
             let msg = match res {
                 Ok(0) => break,
                 Ok(_) if buf.last() != Some(&b'\n') => Err(anyhow!("malformed server message")),
-                Ok(_) => proto::decode_line::<ServerMsg>(&buf[..buf.len() - 1]).map_err(Into::into),
+                Ok(_) => {
+                    let line = &buf[..buf.len() - 1];
+                    match proto::decode_line::<ServerMsg>(line) {
+                        Ok(m) => Ok(m),
+                        // A message type from a newer server: skip it rather than drop the connection.
+                        Err(e) if serde_json::from_slice::<serde_json::Value>(line).is_ok() => {
+                            warn!("Skipping unknown server message: {e}");
+                            continue;
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                }
                 Err(e) => Err(e.into()),
             };
             let stop = msg.is_err();
@@ -285,30 +300,37 @@ async fn session(conn: quinn::Connection, t: &Target, io: &mut Io) -> Result<End
         version: proto::PROTOCOL_VERSION,
         name: t.name.clone(),
         password: t.password.clone(),
+        features: vec![proto::FEATURE_CHAT.into()],
     }))
     .await?;
 
     let first = tokio::time::timeout(Duration::from_secs(8), lines.recv())
         .await
         .map_err(|_| anyhow!("server did not say hello"))?;
-    let (my_id, server_name, users) = match first {
-        Some(Ok(ServerMsg::Welcome { your_id, server_name, users })) => (your_id, server_name, users),
+    let (my_id, server_name, users, features) = match first {
+        Some(Ok(ServerMsg::Welcome { your_id, server_name, users, features })) => (your_id, server_name, users, features),
         Some(Ok(ServerMsg::Reject { reason })) => return Ok(End::Rejected(reason)),
         Some(Ok(other)) => bail!("unexpected server response: {other:?}"),
         Some(Err(e)) => return Err(e),
         None => bail!("server closed the connection"),
     };
     info!("Connected to \"{server_name}\" as #{my_id}");
+    let chat = features.iter().any(|f| f == proto::FEATURE_CHAT);
     io.shared.update(|s| {
         s.conn = ConnState::Connected { server_name };
         s.my_id = Some(my_id);
+        s.chat_available = chat;
+        // The server replays its recent messages right after Welcome.
+        s.chat.clear();
+        s.unread = 0;
         s.users = users.into_iter().map(|u| (u.id, UserView { info: u, ping_ms: None, last_voice: None })).collect();
     });
     // Mute state from before the (re)connection.
-    let muted = io.shared.muted.load(std::sync::atomic::Ordering::Relaxed);
-    let deafened = io.shared.deafened.load(std::sync::atomic::Ordering::Relaxed);
-    if muted || deafened {
-        send.write_all(&proto::encode_line(&ClientMsg::State { muted, deafened })).await?;
+    let muted = io.shared.muted.load(Ordering::Relaxed);
+    let deafened = io.shared.deafened.load(Ordering::Relaxed);
+    let away = io.shared.away.load(Ordering::Relaxed);
+    if muted || deafened || away {
+        send.write_all(&proto::encode_line(&ClientMsg::State { muted, deafened, away })).await?;
     }
 
     // Drop whatever piled up in the queue before connecting.
@@ -328,8 +350,14 @@ async fn session(conn: quinn::Connection, t: &Target, io: &mut Io) -> Result<End
                     conn.close(0u32.into(), b"switching server");
                     return Ok(End::Switch(nt));
                 }
-                Some(Command::SetState { muted, deafened }) => {
-                    send.write_all(&proto::encode_line(&ClientMsg::State { muted, deafened })).await?;
+                Some(Command::SetState { muted, deafened, away }) => {
+                    send.write_all(&proto::encode_line(&ClientMsg::State { muted, deafened, away })).await?;
+                }
+                Some(Command::Chat(text)) => {
+                    let text = proto::sanitize_chat(&text);
+                    if chat && !text.is_empty() {
+                        send.write_all(&proto::encode_line(&ClientMsg::Chat { text })).await?;
+                    }
                 }
             },
             v = io.voice_rx.recv() => {
@@ -369,10 +397,24 @@ fn handle_msg(shared: &Shared, m: ServerMsg) {
         ServerMsg::Left { id } => {
             s.users.remove(&id);
         }
-        ServerMsg::State { id, muted, deafened } => {
+        ServerMsg::State { id, muted, deafened, away } => {
             if let Some(u) = s.users.get_mut(&id) {
                 u.info.muted = muted;
                 u.info.deafened = deafened;
+                u.info.away = away;
+            }
+        }
+        ServerMsg::Chat { line, history } => {
+            let mine = s.my_name() == Some(line.name.as_str());
+            if !history && !mine && !shared.focused.load(Ordering::Relaxed) {
+                s.unread += 1;
+                if shared.chat_sound.load(Ordering::Relaxed) {
+                    shared.chime.store(true, Ordering::Relaxed);
+                }
+            }
+            s.chat.push_back(line);
+            if s.chat.len() > proto::CHAT_HISTORY {
+                s.chat.pop_front();
             }
         }
         ServerMsg::Pings { pings } => {

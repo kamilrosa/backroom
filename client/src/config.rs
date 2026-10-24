@@ -50,6 +50,8 @@ pub struct Config {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub master_volume: f32,
+    /// Sound on a new chat message while the window is in the background.
+    pub chat_sound: bool,
     /// Per-person volume (by nickname), 1.0 = 100%.
     pub volumes: BTreeMap<String, f32>,
     /// People muted locally (by nickname).
@@ -72,6 +74,7 @@ impl Default for Config {
             input_device: None,
             output_device: None,
             master_volume: 1.0,
+            chat_sound: false,
             volumes: BTreeMap::new(),
             local_mutes: BTreeSet::new(),
             fingerprints: BTreeMap::new(),

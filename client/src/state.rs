@@ -3,11 +3,11 @@
 //! Settings read in the audio loop are atomics (lock-free); display state
 //! sits behind a mutex and the UI copies it once per frame.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use backroom_proto::{UserId, UserInfo};
+use backroom_proto::{ChatLine, UserId, UserInfo};
 use parking_lot::Mutex;
 
 /// Length of the mic test recording.
@@ -87,6 +87,17 @@ pub struct Status {
     pub ptt_available: bool,
     pub ptt_message: String,
     pub denoise_available: bool,
+    /// The server supports chat (older servers do not).
+    pub chat_available: bool,
+    pub chat: VecDeque<ChatLine>,
+    /// Messages from others that arrived while the window was in the background.
+    pub unread: u32,
+}
+
+impl Status {
+    pub fn my_name(&self) -> Option<&str> {
+        self.my_id.and_then(|id| self.users.get(&id)).map(|u| u.info.name.as_str())
+    }
 }
 
 impl Default for Status {
@@ -102,6 +113,9 @@ impl Default for Status {
             ptt_available: false,
             ptt_message: String::new(),
             denoise_available: true,
+            chat_available: false,
+            chat: VecDeque::new(),
+            unread: 0,
         }
     }
 }
@@ -110,12 +124,21 @@ pub struct Shared {
     // --- settings (UI → audio) ---
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
+    pub away: AtomicBool,
     pub push_to_talk: AtomicBool,
     pub ptt_down: AtomicBool,
     pub vad_threshold: AtomicF32,
     pub denoise: AtomicBool,
     pub mic_test: Mutex<MicTest>,
     pub master_volume: AtomicF32,
+    pub chat_sound: AtomicBool,
+    /// The window has focus — new messages are not "unread" and make no sound.
+    pub focused: AtomicBool,
+    /// Typing in the chat box — push-to-talk is ignored meanwhile, in case
+    /// the key is a letter.
+    pub typing: AtomicBool,
+    /// Play the new-message sound (network → playback thread).
+    pub chime: AtomicBool,
     /// Per-person volume (local mute already applied).
     pub gains: Mutex<HashMap<UserId, f32>>,
     /// Selected devices + a change counter so the audio threads know they have
@@ -137,12 +160,17 @@ impl Shared {
         Self {
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
+            away: AtomicBool::new(false),
             push_to_talk: AtomicBool::new(cfg.push_to_talk),
             ptt_down: AtomicBool::new(false),
             vad_threshold: AtomicF32::new(cfg.sensitivity.threshold_db()),
             denoise: AtomicBool::new(cfg.denoise),
             mic_test: Mutex::new(MicTest::Idle),
             master_volume: AtomicF32::new(cfg.master_volume),
+            chat_sound: AtomicBool::new(cfg.chat_sound),
+            focused: AtomicBool::new(true),
+            typing: AtomicBool::new(false),
+            chime: AtomicBool::new(false),
             gains: Mutex::new(HashMap::new()),
             input_choice: Mutex::new(cfg.input_device.clone()),
             output_choice: Mutex::new(cfg.output_device.clone()),

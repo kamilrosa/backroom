@@ -46,8 +46,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Backroom")
-            .with_inner_size([420.0, 560.0])
-            .with_min_inner_size([340.0, 380.0]),
+            .with_inner_size([420.0, 680.0])
+            .with_min_inner_size([340.0, 460.0]),
         ..Default::default()
     };
     eframe::run_native(

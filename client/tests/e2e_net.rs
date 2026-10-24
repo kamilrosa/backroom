@@ -1,6 +1,7 @@
 //! End-to-end test: a real server + several clients (no audio) in one
 //! process, over QUIC on localhost.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use backroom_client::net::{self, Command, NetHandle, Target};
 use backroom_client::state::{ConnState, Shared};
 use backroom_proto as proto;
 use parking_lot::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct Client {
     shared: Arc<Shared>,
@@ -52,6 +54,22 @@ impl Client {
 
     fn users(&self) -> Vec<String> {
         self.shared.status.lock().users.values().map(|u| u.info.name.clone()).collect()
+    }
+
+    fn chat(&self) -> Vec<(String, String)> {
+        self.shared.status.lock().chat.iter().map(|l| (l.name.clone(), l.text.clone())).collect()
+    }
+}
+
+/// Reads control lines until `ms` pass without a new one.
+async fn read_lines(r: &mut BufReader<quinn::RecvStream>, ms: u64) -> Vec<String> {
+    let mut lines = vec![];
+    loop {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_millis(ms), r.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => lines.push(line),
+            _ => return lines,
+        }
     }
 }
 
@@ -103,20 +121,67 @@ async fn full_flow() {
     assert!(recv_voice(&a, 200).is_none(), "A does not hear itself");
 
     // --- mute: state visible to others, voice not forwarded ---
-    a.net.cmd.send(Command::SetState { muted: true, deafened: false }).unwrap();
+    a.net.cmd.send(Command::SetState { muted: true, deafened: false, away: false }).unwrap();
     let a_id = a.my_id();
     wait_for("B sees A muted", 5, || b.shared.status.lock().users.get(&a_id).is_some_and(|u| u.info.muted)).await;
     a.voice.send(proto::encode_voice_up(0, 2, &[1])).await.unwrap();
     assert!(recv_voice(&b, 300).is_none(), "server does not forward a muted user's voice");
-    a.net.cmd.send(Command::SetState { muted: false, deafened: false }).unwrap();
+    a.net.cmd.send(Command::SetState { muted: false, deafened: false, away: false }).unwrap();
 
     // --- a deafened user receives no voice ---
-    b.net.cmd.send(Command::SetState { muted: false, deafened: true }).unwrap();
+    b.net.cmd.send(Command::SetState { muted: false, deafened: true, away: false }).unwrap();
     let b_id = b.my_id();
     wait_for("A sees B deafened", 5, || a.shared.status.lock().users.get(&b_id).is_some_and(|u| u.info.deafened)).await;
     a.voice.send(proto::encode_voice_up(0, 3, &[2])).await.unwrap();
     assert!(recv_voice(&b, 300).is_none(), "deafened user receives nothing");
-    b.net.cmd.send(Command::SetState { muted: false, deafened: false }).unwrap();
+    b.net.cmd.send(Command::SetState { muted: false, deafened: false, away: false }).unwrap();
+
+    // --- "be right back" ---
+    a.net.cmd.send(Command::SetState { muted: false, deafened: false, away: true }).unwrap();
+    wait_for("B sees A away", 5, || b.shared.status.lock().users.get(&a_id).is_some_and(|u| u.info.away)).await;
+
+    // --- chat: everyone gets the message, the sender too ---
+    assert!(a.shared.status.lock().chat_available && b.shared.status.lock().chat_available);
+    a.net.cmd.send(Command::Chat("  brb\nin 5 min ".into())).unwrap();
+    let brb = vec![("Alice".to_string(), "brb in 5 min".to_string())];
+    wait_for("chat reaches A and B", 5, || a.chat() == brb && b.chat() == brb).await;
+
+    // --- unread counter and sound only for others' messages while in the background ---
+    a.shared.focused.store(false, Ordering::Relaxed);
+    a.shared.chat_sound.store(true, Ordering::Relaxed);
+    b.net.cmd.send(Command::Chat("ok".into())).unwrap();
+    wait_for("A counts an unread message", 5, || a.shared.status.lock().unread == 1).await;
+    assert!(a.shared.chime.load(Ordering::Relaxed), "A plays the sound");
+    assert_eq!(b.shared.status.lock().unread, 0, "the window has focus — nothing unread");
+    a.net.cmd.send(Command::Chat("back".into())).unwrap();
+    wait_for("A sees its own message", 5, || a.chat().len() == 3).await;
+    assert_eq!(a.shared.status.lock().unread, 1, "own messages are not unread");
+
+    // --- flood protection ---
+    for i in 0..10 {
+        b.net.cmd.send(Command::Chat(format!("spam {i}"))).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let spam = a.chat().iter().filter(|(_, t)| t.starts_with("spam")).count();
+    assert!((1..10).contains(&spam), "server drops a flood ({spam} of 10 passed)");
+
+    // --- an older client (no chat feature) gets no chat messages, so it is not disconnected ---
+    let old = net::connect(addr.parse().unwrap(), None, Default::default()).await.unwrap();
+    let (mut send, recv) = old.open_bi().await.unwrap();
+    send.write_all(b"{\"t\":\"hello\",\"version\":1,\"name\":\"Old\",\"password\":\"secret\"}\n").await.unwrap();
+    let mut recv = BufReader::new(recv);
+    let mut lines = read_lines(&mut recv, 500).await;
+    a.net.cmd.send(Command::Chat("new clients only".into())).unwrap();
+    wait_for("B gets the message", 5, || b.chat().iter().any(|(_, t)| t == "new clients only")).await;
+    lines.extend(read_lines(&mut recv, 300).await);
+    assert!(lines.first().is_some_and(|l| l.contains("\"welcome\"")), "old client joined: {lines:?}");
+    for l in &lines {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        let t = v["t"].as_str().unwrap();
+        assert!(["welcome", "joined", "left", "state", "pings"].contains(&t), "0.1.x does not know \"{t}\"");
+    }
+    old.close(0u32.into(), b"bye");
+    wait_for("old client gone", 5, || b.users().len() == 2).await;
 
     // --- wrong password ---
     let c = Client::new();
@@ -127,6 +192,7 @@ async fn full_flow() {
     // --- full room (limit 3) ---
     c.connect(&addr, "Carol", "secret");
     wait_for("C joins", 10, || c.connected()).await;
+    wait_for("C gets the chat history", 5, || c.chat().first() == brb.first()).await;
     let d = Client::new();
     d.connect(&addr, "Dave", "secret");
     wait_for("rejected when the room is full", 10, || matches!(d.conn(), ConnState::Failed { .. })).await;

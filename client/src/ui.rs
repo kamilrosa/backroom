@@ -1,9 +1,11 @@
 //! The program window. Deliberately few options: connect, talk, listen.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use backroom_proto::ChatLine;
 use eframe::egui::{self, Color32, RichText};
 use parking_lot::Mutex;
 
@@ -15,6 +17,8 @@ use crate::state::{ConnState, DeviceStatus, MicTest, Shared, Status, MIC_TEST_LE
 const GREEN: Color32 = Color32::from_rgb(64, 192, 87);
 const RED: Color32 = Color32::from_rgb(230, 80, 80);
 const AMBER: Color32 = Color32::from_rgb(230, 170, 50);
+/// How long someone's last chat message is shown under their nickname.
+const RECENT_MESSAGE: Duration = Duration::from_secs(5 * 60);
 
 pub struct App {
     shared: Arc<Shared>,
@@ -26,6 +30,9 @@ pub struct App {
     password: String,
     dirty: Option<Instant>,
     show_settings: bool,
+    chat_input: String,
+    title: String,
+    last_unread: u32,
 }
 
 impl App {
@@ -34,7 +41,20 @@ impl App {
             let c = config.lock();
             (c.server.clone(), c.name.clone(), c.password.clone(), c.auto_connect)
         };
-        let app = Self { shared, config, net, hk, server, name, password, dirty: None, show_settings: false };
+        let app = Self {
+            shared,
+            config,
+            net,
+            hk,
+            server,
+            name,
+            password,
+            dirty: None,
+            show_settings: false,
+            chat_input: String::new(),
+            title: "Backroom".into(),
+            last_unread: 0,
+        };
         if auto && !app.server.is_empty() && !app.name.is_empty() {
             app.connect();
         }
@@ -58,7 +78,27 @@ impl App {
         let _ = self.net.cmd.send(Command::SetState {
             muted: self.shared.muted.load(Ordering::Relaxed),
             deafened: self.shared.deafened.load(Ordering::Relaxed),
+            away: self.shared.away.load(Ordering::Relaxed),
         });
+    }
+
+    /// Unread counter in the window title, taskbar flash on a new message.
+    fn unread_ui(&mut self, ctx: &egui::Context, st: &Status) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        self.shared.focused.store(focused, Ordering::Relaxed);
+        if focused && st.unread > 0 {
+            self.shared.status.lock().unread = 0;
+        }
+        let unread = if focused { 0 } else { st.unread };
+        if unread > self.last_unread {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
+        self.last_unread = unread;
+        let title = if unread > 0 { format!("Backroom ({unread})") } else { "Backroom".into() };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
     }
 
     fn sync_gains(&self, st: &Status) {
@@ -83,6 +123,7 @@ impl eframe::App for App {
         }
         // The speaking and level indicators need smooth repainting.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
+        self.unread_ui(&ui.ctx().clone(), &st);
 
         egui::Panel::top("conn").show(ui, |ui| {
             ui.add_space(6.0);
@@ -94,9 +135,17 @@ impl eframe::App for App {
             self.me_ui(ui, &st);
             ui.add_space(6.0);
         });
+        let mut typing = false;
         egui::CentralPanel::default().show(ui, |ui| {
+            if matches!(st.conn, ConnState::Connected { .. } | ConnState::Reconnecting { .. }) {
+                egui::Panel::bottom("chat")
+                    .resizable(true)
+                    .default_size(180.0)
+                    .show(ui, |ui| typing = self.chat_ui(ui, &st));
+            }
             egui::ScrollArea::vertical().show(ui, |ui| self.users_ui(ui, &st));
         });
+        self.shared.typing.store(typing, Ordering::Relaxed);
     }
 
     fn on_exit(&mut self) {
@@ -222,6 +271,9 @@ impl App {
                     name = name.strong();
                 }
                 ui.label(name);
+                if u.info.away {
+                    ui.label(RichText::new("away").small().color(AMBER));
+                }
                 if u.info.deafened {
                     ui.label(RichText::new("deafened").small().color(AMBER));
                 } else if u.info.muted {
@@ -259,7 +311,63 @@ impl App {
                     });
                 }
             });
+            if let Some(text) = recent_message(&st.chat, &u.info.name) {
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.add(egui::Label::new(RichText::new(text).small().italics().weak()).truncate());
+                });
+            }
         }
+    }
+
+    /// Returns whether the message box has focus (push-to-talk is ignored then).
+    fn chat_ui(&mut self, ui: &mut egui::Ui, st: &Status) -> bool {
+        let connected = matches!(st.conn, ConnState::Connected { .. });
+        let my_name = st.my_name();
+        let mut typing = false;
+        ui.add_space(4.0);
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            if connected && !st.chat_available {
+                ui.colored_label(AMBER, "Chat needs a newer server — ask whoever runs it to update.");
+            } else {
+                let input = ui.add_enabled(
+                    connected,
+                    egui::TextEdit::singleline(&mut self.chat_input)
+                        .hint_text("Message… (Enter sends)")
+                        .char_limit(backroom_proto::MAX_CHAT_LEN)
+                        .desired_width(f32::INFINITY),
+                );
+                typing = input.has_focus();
+                if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let text = std::mem::take(&mut self.chat_input);
+                    if !text.trim().is_empty() {
+                        let _ = self.net.cmd.send(Command::Chat(text));
+                    }
+                    input.request_focus();
+                }
+            }
+            ui.add_space(4.0);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show(ui, |ui| {
+                    if st.chat.is_empty() {
+                        ui.label(RichText::new("No messages yet.").weak());
+                    }
+                    for line in &st.chat {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(RichText::new(clock(line.time)).color(ui.visuals().weak_text_color().gamma_multiply(0.7)));
+                            let mut name = RichText::new(&line.name).strong();
+                            if Some(line.name.as_str()) == my_name {
+                                name = name.color(GREEN);
+                            }
+                            ui.label(name);
+                            ui.label(&line.text);
+                        });
+                    }
+                });
+            });
+        });
+        typing
     }
 
     fn me_ui(&mut self, ui: &mut egui::Ui, st: &Status) {
@@ -277,6 +385,11 @@ impl App {
             if ui.add(egui::Button::selectable(deaf, deaf_label)).on_hover_text("Deafen = you hear nothing and transmit nothing").clicked() {
                 deaf = !deaf;
                 shared.deafened.store(deaf, Ordering::Relaxed);
+                self.send_state();
+            }
+            let away = shared.away.load(Ordering::Relaxed);
+            if ui.add(egui::Button::selectable(away, "☕ Away")).on_hover_text("Tell the others you'll be right back").clicked() {
+                shared.away.store(!away, Ordering::Relaxed);
                 self.send_state();
             }
         });
@@ -440,6 +553,15 @@ impl App {
         if !st.denoise_available {
             ui.colored_label(AMBER, "Noise suppression failed to start on this computer.");
         }
+        let mut cs = shared.chat_sound.load(Ordering::Relaxed);
+        if ui
+            .checkbox(&mut cs, "Sound on new chat message")
+            .on_hover_text("Only while the Backroom window is in the background")
+            .changed()
+        {
+            shared.chat_sound.store(cs, Ordering::Relaxed);
+            self.edit_config(|c| c.chat_sound = cs);
+        }
         ui.horizontal(|ui| {
             if ui.button("Restart audio").on_hover_text("Reopens the microphone and speakers").clicked() {
                 shared.restart_audio();
@@ -483,6 +605,23 @@ fn device_combo(ui: &mut egui::Ui, id: &str, choice: &mut Option<String>, list: 
         }
     });
     *choice != before
+}
+
+/// Server time (Unix seconds) as local HH:MM.
+fn clock(unix: u64) -> String {
+    chrono::DateTime::from_timestamp(unix as i64, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Someone's last chat message, if it is from the last few minutes.
+fn recent_message<'a>(chat: &'a VecDeque<ChatLine>, name: &str) -> Option<&'a str> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    chat.iter()
+        .rev()
+        .find(|l| l.name == name)
+        .filter(|l| now.saturating_sub(l.time) < RECENT_MESSAGE.as_secs())
+        .map(|l| l.text.as_str())
 }
 
 fn short_fp(fp: &str) -> String {

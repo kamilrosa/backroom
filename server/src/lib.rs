@@ -5,15 +5,15 @@
 //! else. That keeps CPU usage on a Raspberry Pi at a fraction of a percent
 //! even with 10 people.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use backroom_proto::{self as proto, ClientMsg, ServerMsg, UserId, UserInfo};
+use backroom_proto::{self as proto, ChatLine, ClientMsg, ServerMsg, UserId, UserInfo};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -34,17 +34,25 @@ pub struct Settings {
 /// Largest sensible voice packet; bigger ones are dropped.
 const MAX_VOICE_PACKET: usize = 1000;
 const MAX_LINE: usize = 4096;
+/// Chat flood protection: at most this many messages per `CHAT_WINDOW`.
+const CHAT_BURST: usize = 5;
+const CHAT_WINDOW: Duration = Duration::from_secs(5);
 
 struct Peer {
     info: UserInfo,
     conn: quinn::Connection,
     tx: mpsc::UnboundedSender<ServerMsg>,
+    /// Announced `FEATURE_CHAT` — older clients drop the connection on a
+    /// message type they do not know, so they never get chat messages.
+    chat: bool,
 }
 
 #[derive(Default)]
 struct Room {
     peers: HashMap<UserId, Peer>,
     next_id: UserId,
+    /// Recent chat messages, kept in memory only.
+    history: VecDeque<ChatLine>,
 }
 
 impl Room {
@@ -62,6 +70,17 @@ impl Room {
             if Some(*id) != except {
                 let _ = p.tx.send(msg.clone());
             }
+        }
+    }
+
+    fn chat(&mut self, line: ChatLine) {
+        let msg = ServerMsg::Chat { line: line.clone(), history: false };
+        for p in self.peers.values().filter(|p| p.chat) {
+            let _ = p.tx.send(msg.clone());
+        }
+        self.history.push_back(line);
+        if self.history.len() > proto::CHAT_HISTORY {
+            self.history.pop_front();
         }
     }
 }
@@ -233,6 +252,7 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
         version,
         name,
         password,
+        features,
     } = proto::decode_line(&line)?
     else {
         bail!("first message is not Hello");
@@ -254,6 +274,7 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
         return Err(reject(&mut send, &conn, "Please enter a nickname.".into()).await);
     }
 
+    let chat = features.iter().any(|f| f == proto::FEATURE_CHAT);
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
     let joined = {
         let mut room = ctx.room.lock().unwrap();
@@ -283,6 +304,7 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
                 name: name.clone(),
                 muted: false,
                 deafened: false,
+                away: false,
             };
             let mut users: Vec<UserInfo> = room.peers.values().map(|p| p.info.clone()).collect();
             users.push(info.clone());
@@ -291,7 +313,13 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
                 your_id: my_id,
                 server_name: ctx.name.clone(),
                 users,
+                features: vec![proto::FEATURE_CHAT.into()],
             });
+            if chat {
+                for line in &room.history {
+                    let _ = tx.send(ServerMsg::Chat { line: line.clone(), history: true });
+                }
+            }
             room.broadcast(&ServerMsg::Joined { user: info.clone() }, None);
             room.peers.insert(
                 my_id,
@@ -299,6 +327,7 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
                     info,
                     conn: conn.clone(),
                     tx,
+                    chat,
                 },
             );
             Some(my_id)
@@ -322,7 +351,7 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
         }
     });
 
-    let result = session(&ctx, &conn, my_id, recv).await;
+    let result = session(&ctx, &conn, my_id, &name, recv).await;
 
     {
         let mut room = ctx.room.lock().unwrap();
@@ -389,9 +418,11 @@ async fn session(
     ctx: &Ctx,
     conn: &quinn::Connection,
     my_id: UserId,
+    name: &str,
     recv: BufReader<quinn::RecvStream>,
 ) -> Result<()> {
     let mut lines = spawn_reader(recv);
+    let mut recent_chat: VecDeque<Instant> = VecDeque::new();
     loop {
         tokio::select! {
             dg = conn.read_datagram() => {
@@ -404,13 +435,30 @@ async fn session(
             line = lines.recv() => {
                 let Some(line) = line else { return Ok(()) };
                 match proto::decode_line::<ClientMsg>(&line?) {
-                    Ok(ClientMsg::State { muted, deafened }) => {
+                    Ok(ClientMsg::State { muted, deafened, away }) => {
                         let mut room = ctx.room.lock().unwrap();
                         if let Some(p) = room.peers.get_mut(&my_id) {
                             p.info.muted = muted;
                             p.info.deafened = deafened;
+                            p.info.away = away;
                         }
-                        room.broadcast(&ServerMsg::State { id: my_id, muted, deafened }, None);
+                        room.broadcast(&ServerMsg::State { id: my_id, muted, deafened, away }, None);
+                    }
+                    Ok(ClientMsg::Chat { text }) => {
+                        let text = proto::sanitize_chat(&text);
+                        if text.is_empty() {
+                            continue;
+                        }
+                        while recent_chat.front().is_some_and(|t| t.elapsed() > CHAT_WINDOW) {
+                            recent_chat.pop_front();
+                        }
+                        if recent_chat.len() >= CHAT_BURST {
+                            warn!("#{my_id}: chat flood, message dropped");
+                            continue;
+                        }
+                        recent_chat.push_back(Instant::now());
+                        let time = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                        ctx.room.lock().unwrap().chat(ChatLine { name: name.to_string(), time, text });
                     }
                     Ok(other) => warn!("#{my_id}: unexpected message {other:?}"),
                     Err(e) => warn!("#{my_id}: malformed message: {e}"),

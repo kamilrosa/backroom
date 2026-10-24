@@ -5,6 +5,10 @@
 //!   `\n`-terminated JSON messages (easy to read in logs).
 //! - Voice: QUIC datagrams (no reliability needed — a late voice packet is
 //!   useless, and Opus FEC and PLC conceal losses).
+//!
+//! Compatibility: new fields always have `#[serde(default)]` (older versions
+//! skip fields they do not know), and new message types are only sent to a
+//! peer that announced the matching feature in `Hello` / `Welcome`.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +25,13 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// Opus frame: 20 ms at 48 kHz.
 pub const FRAME_SAMPLES: usize = 960;
 pub const MAX_NAME_LEN: usize = 32;
+/// Chat message length limit, in characters.
+pub const MAX_CHAT_LEN: usize = 500;
+/// How many recent chat messages the server keeps for people who join later.
+pub const CHAT_HISTORY: usize = 50;
+
+/// Feature: text chat (`ClientMsg::Chat`, `ServerMsg::Chat`).
+pub const FEATURE_CHAT: &str = "chat";
 
 /// Connection close code: someone logged in with the same nickname.
 /// The client does not reconnect after it (otherwise two people with the
@@ -35,6 +46,17 @@ pub struct UserInfo {
     pub name: String,
     pub muted: bool,
     pub deafened: bool,
+    /// "Be right back".
+    #[serde(default)]
+    pub away: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatLine {
+    pub name: String,
+    /// Server time, Unix seconds.
+    pub time: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,10 +66,18 @@ pub enum ClientMsg {
         version: u32,
         name: String,
         password: String,
+        /// Optional features this client understands (`FEATURE_*`).
+        #[serde(default)]
+        features: Vec<String>,
     },
     State {
         muted: bool,
         deafened: bool,
+        #[serde(default)]
+        away: bool,
+    },
+    Chat {
+        text: String,
     },
 }
 
@@ -58,6 +88,9 @@ pub enum ServerMsg {
         your_id: UserId,
         server_name: String,
         users: Vec<UserInfo>,
+        /// Optional features this server supports (`FEATURE_*`).
+        #[serde(default)]
+        features: Vec<String>,
     },
     Reject {
         reason: String,
@@ -72,6 +105,15 @@ pub enum ServerMsg {
         id: UserId,
         muted: bool,
         deafened: bool,
+        #[serde(default)]
+        away: bool,
+    },
+    /// Only sent to clients with `FEATURE_CHAT`. Right after `Welcome` the
+    /// server replays its recent messages with `history: true`.
+    Chat {
+        line: ChatLine,
+        #[serde(default)]
+        history: bool,
     },
     /// Each user's ping (QUIC RTT) to the server, in ms. Sent every ~2 s.
     Pings {
@@ -180,6 +222,19 @@ pub fn sanitize_name(raw: &str) -> String {
         .to_string()
 }
 
+/// Chat text normalization: a single line, no control characters, length limit.
+pub fn sanitize_chat(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_CHAT_LEN)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,11 +259,29 @@ mod tests {
 
     #[test]
     fn control_json() {
-        let m = ClientMsg::Hello { version: 1, name: "Alice".into(), password: "x".into() };
+        let m = ClientMsg::Hello { version: 1, name: "Alice".into(), password: "x".into(), features: vec![FEATURE_CHAT.into()] };
         let line = encode_line(&m);
         assert_eq!(*line.last().unwrap(), b'\n');
         let back: ClientMsg = decode_line(&line[..line.len() - 1]).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn older_versions_still_decode() {
+        // 0.1.x messages have no `features` / `away` fields.
+        let hello: ClientMsg = decode_line(br#"{"t":"hello","version":1,"name":"A","password":"x"}"#).unwrap();
+        assert!(matches!(hello, ClientMsg::Hello { features, .. } if features.is_empty()));
+        let st: ServerMsg = decode_line(br#"{"t":"state","id":3,"muted":true,"deafened":false}"#).unwrap();
+        assert_eq!(st, ServerMsg::State { id: 3, muted: true, deafened: false, away: false });
+        let u: UserInfo = serde_json::from_str(r#"{"id":1,"name":"A","muted":false,"deafened":false}"#).unwrap();
+        assert!(!u.away);
+    }
+
+    #[test]
+    fn chat_text() {
+        assert_eq!(sanitize_chat("  brb\nin 5\tmin \u{7} "), "brb in 5 min");
+        assert_eq!(sanitize_chat(" \n "), "");
+        assert_eq!(sanitize_chat(&"ż".repeat(600)).chars().count(), MAX_CHAT_LEN);
     }
 
     #[test]

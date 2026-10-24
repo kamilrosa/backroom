@@ -28,7 +28,12 @@ You also need a server to connect to — the address and password come from whoe
    Nobody hears you during the test.
 5. The slider next to a person sets their volume for you only. 🔈 mutes them for you only.
 6. **🎤 Microphone** mutes you for everyone. **🔊 Listening / Deafened**: when deafened you hear nothing
-   and transmit nothing.
+   and transmit nothing. **☕ Away** shows "away" next to your nickname until you click it again.
+7. **Chat** at the bottom of the list: type and press Enter. People who join later see the last 50
+   messages; each person's latest message also shows under their nickname for 5 minutes. While Backroom
+   is in the background, the window title counts unread messages (`Backroom (2)`); *Settings → Sound on
+   new chat message* adds a short sound. Push-to-talk is ignored while you type, in case the key is a
+   letter. Chat needs a server from version 0.2.0.
 
 The bottom of the window shows `🎤 … : OK` and `🔊 … : OK`. If the program fixed a device by itself
 (headphones unplugged, a stuck driver, a new default device), hover over the line to see how many times

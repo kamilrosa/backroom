@@ -121,7 +121,7 @@ impl MicChain {
         let testing = matches!(*shared.mic_test.lock(), MicTest::Recording { .. });
         let muted = !testing && (shared.muted.load(Ordering::Relaxed) || shared.deafened.load(Ordering::Relaxed));
         let active = if shared.push_to_talk.load(Ordering::Relaxed) {
-            shared.ptt_down.load(Ordering::Relaxed)
+            shared.ptt_down.load(Ordering::Relaxed) && !shared.typing.load(Ordering::Relaxed)
         } else {
             speech
         };

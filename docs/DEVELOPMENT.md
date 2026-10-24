@@ -80,7 +80,8 @@ cargo clippy --workspace
 The end-to-end test (`client/tests/e2e_net.rs`) starts a real server and several network clients in one
 process and checks: voice relaying (no echo back to the sender), mute and deafen, wrong password, full
 room, duplicate nickname (no kick loop), automatic reconnection after a server restart and detection of a
-changed certificate.
+changed certificate, plus chat, history for late joiners, the away status, unread counting, flood
+protection and that a 0.1.x client (no `features` in `Hello`) never gets a message type it does not know.
 
 ```bash
 # Microphone chain on WAV files (48 kHz mono 16-bit): what share of noise-only and of speech
@@ -104,7 +105,12 @@ others ─► adaptive jitter buffer (FEC/PLC on loss) ─► mix ─► watchdo
 
 - **QUIC** (`quinn`), one connection per client, ALPN `backroom/1`.
 - **Control:** a single bidirectional stream opened by the client with `\n`-terminated JSON messages
-  (`Hello`, `State` → `Welcome`, `Reject`, `Joined`, `Left`, `State`, `Pings`).
+  (`Hello`, `State`, `Chat` → `Welcome`, `Reject`, `Joined`, `Left`, `State`, `Pings`, `Chat`).
+- **Compatibility without a version bump:** new fields always have `#[serde(default)]`, so older
+  versions skip them (e.g. `away` in `State`). New message types are gated by features: the client lists
+  them in `Hello.features`, the server in `Welcome.features`, and each side only sends a message type the
+  other announced. A 0.1.x client drops the connection on an unknown message type; since 0.2 the client
+  skips it instead.
 - **Voice:** QUIC datagrams. Client → server: `[kind][flags][seq u32]` + Opus; server → client additionally
   carries the sender id. Flags `START`/`END` mark the boundaries of an utterance.
 - A late voice packet is useless, so there are no retransmissions; Opus FEC and PLC conceal losses.
@@ -119,6 +125,10 @@ others ─► adaptive jitter buffer (FEC/PLC on loss) ─► mix ─► watchdo
   nickname do not keep kicking each other out.
 - Muted users are not relayed; deafened users receive nothing, which saves bandwidth.
 - Every 2 s the server broadcasts each user's ping (QUIC RTT).
+- **Chat:** the server relays each message to every chat-capable client, the sender included, so
+  everyone sees the same order. It keeps the last 50 in memory (never on disk) and replays them after
+  `Welcome` with `history: true`. Text is one line of at most 500 characters; more than 5 messages in
+  5 s from one person are dropped.
 
 ### Client (`client/src/`)
 

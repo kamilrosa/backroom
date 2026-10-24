@@ -569,6 +569,34 @@ impl Peer {
     }
 }
 
+/// Adds the next frame of a prerecorded sound to `mix`; false once it has ended.
+fn mix_next(mix: &mut [f32], pcm: &[f32], pos: &mut usize, gain: f32) -> bool {
+    let end = (*pos + mix.len()).min(pcm.len());
+    for (m, s) in mix.iter_mut().zip(&pcm[*pos..end]) {
+        *m += s * gain;
+    }
+    *pos = end;
+    end < pcm.len()
+}
+
+/// The new chat message sound: two short bell-like tones, 48 kHz.
+fn chime() -> Vec<f32> {
+    const RATE: f32 = 48_000.0;
+    let tone = |f: f32, t: f32| {
+        if t < 0.0 {
+            return 0.0;
+        }
+        // 2.5 ms fade-in against a click, then an exponential decay.
+        (std::f32::consts::TAU * f * t).sin() * (t * 400.0).min(1.0) * (-t * 14.0).exp()
+    };
+    (0..(0.45 * RATE) as usize)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            0.18 * (tone(880.0, t) + tone(1318.5, t - 0.09))
+        })
+        .collect()
+}
+
 fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receiver<Vec<f32>>) {
     let host = cpal::default_host();
     let mut output: Option<OpenOutput> = None;
@@ -583,6 +611,8 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
     let mut out = Vec::with_capacity(4096);
     // Mic test recording and its playback position.
     let mut clip: Option<(Vec<f32>, usize)> = None;
+    let chime_pcm = chime();
+    let mut chime_pos: Option<usize> = None;
 
     loop {
         if output.is_none() && last_try.elapsed() >= RETRY_OPEN_EVERY {
@@ -623,6 +653,9 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
         if clip.is_some() && !matches!(*shared.mic_test.lock(), MicTest::Playing { .. }) {
             clip = None; // cancelled
         }
+        if shared.chime.swap(false, Ordering::Relaxed) {
+            chime_pos = Some(0);
+        }
 
         if let Some(o) = output.as_mut() {
             // Keep about 40 ms in the card's buffer (or 2 callbacks if the
@@ -635,11 +668,12 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
                 mix.fill(0.0);
                 let now = Instant::now();
                 if let Some((pcm, pos)) = clip.as_mut() {
-                    let end = (*pos + FRAME_SAMPLES).min(pcm.len());
-                    for (m, s) in mix.iter_mut().zip(&pcm[*pos..end]) {
-                        *m += s * master;
+                    mix_next(&mut mix, pcm, pos, master);
+                }
+                if let Some(pos) = chime_pos.as_mut() {
+                    if !mix_next(&mut mix, &chime_pcm, pos, master) {
+                        chime_pos = None;
                     }
-                    *pos = end;
                 }
                 for (id, peer) in peers.iter_mut() {
                     if peer.jb.pop(&mut one, now) {
