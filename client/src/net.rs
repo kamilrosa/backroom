@@ -18,7 +18,6 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -428,10 +427,6 @@ fn handle_msg(shared: &Shared, m: ServerMsg) {
     });
 }
 
-pub fn fingerprint(cert: &[u8]) -> String {
-    Sha256::digest(cert).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
-}
-
 /// "Trust on first use": the first server certificate is remembered, every
 /// later one must have the same fingerprint. Protects the password from
 /// eavesdropping without buying a certificate for a home Raspberry Pi.
@@ -451,7 +446,7 @@ impl ServerCertVerifier for Tofu {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let fp = fingerprint(end_entity);
+        let fp = proto::fingerprint(end_entity);
         *self.seen.lock() = Some(fp.clone());
         match &self.expected {
             Some(e) if *e != fp => Err(rustls::Error::General("server certificate fingerprint has changed".into())),

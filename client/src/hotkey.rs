@@ -50,14 +50,15 @@ pub fn spawn(shared: Arc<Shared>, hk: Arc<HotkeyState>) {
 
 fn pressed(keys: &[Keycode], mouse: &[bool], b: &Binding) -> bool {
     match b {
-        Binding::Key(k) => keys.iter().any(|x| x.to_string() == *k),
+        // Saved as the key's name (`Display`), parsed back without allocating.
+        Binding::Key(k) => k.parse::<Keycode>().is_ok_and(|k| keys.contains(&k)),
         Binding::Mouse(n) => mouse.get(*n).copied().unwrap_or(false),
     }
 }
 
 fn run(shared: Arc<Shared>, hk: Arc<HotkeyState>) {
     let mut ds: Option<DeviceState> = None;
-    let mut last_try = Instant::now() - Duration::from_secs(10);
+    let mut last_try: Option<Instant> = None;
     // When assigning, first wait until everything is released
     // (e.g. the click on the "Change" button).
     let mut armed = false;
@@ -71,10 +72,10 @@ fn run(shared: Arc<Shared>, hk: Arc<HotkeyState>) {
             continue;
         }
         if ds.is_none() {
-            if last_try.elapsed() < Duration::from_secs(3) {
+            if last_try.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
                 continue;
             }
-            last_try = Instant::now();
+            last_try = Some(Instant::now());
             ds = DeviceState::checked_new();
             let msg = if ds.is_some() {
                 String::new()
@@ -121,5 +122,19 @@ fn run(shared: Arc<Shared>, hk: Arc<HotkeyState>) {
 
         let down = hk.binding.lock().as_ref().is_some_and(|b| pressed(&keys, &mouse, b));
         shared.ptt_down.store(down, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_key_binding_matches() {
+        let b = Binding::Key(Keycode::LControl.to_string());
+        assert!(pressed(&[Keycode::W, Keycode::LControl], &[], &b));
+        assert!(!pressed(&[Keycode::W], &[], &b));
+        assert!(!pressed(&[Keycode::W], &[], &Binding::Key("no such key".into())));
+        assert!(pressed(&[], &[false, false, false, false, true], &Binding::Mouse(4)));
     }
 }

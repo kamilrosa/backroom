@@ -11,6 +11,7 @@
 //! peer that announced the matching feature in `Hello` / `Welcome`.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Protocol identifier in ALPN — client and server must agree.
 pub const ALPN: &[u8] = b"backroom/1";
@@ -119,6 +120,12 @@ pub enum ServerMsg {
     Pings {
         pings: Vec<(UserId, u32)>,
     },
+}
+
+/// Server certificate fingerprint (SHA-256, `AB:CD:…`). The server prints it
+/// and the client remembers it (TOFU), so both must use this one format.
+pub fn fingerprint(cert_der: &[u8]) -> String {
+    Sha256::digest(cert_der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
 }
 
 /// Human-readable rejection reason when versions differ.
@@ -282,6 +289,14 @@ mod tests {
         assert_eq!(sanitize_chat("  brb\nin 5\tmin \u{7} "), "brb in 5 min");
         assert_eq!(sanitize_chat(" \n "), "");
         assert_eq!(sanitize_chat(&"ż".repeat(600)).chars().count(), MAX_CHAT_LEN);
+    }
+
+    #[test]
+    fn fingerprint_format() {
+        // SHA-256 of an empty input.
+        let fp = fingerprint(b"");
+        assert!(fp.starts_with("E3:B0:C4:42:98:FC:1C:14:"), "{fp}");
+        assert_eq!(fp.len(), 32 * 3 - 1);
     }
 
     #[test]

@@ -580,7 +580,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -592,6 +591,7 @@ version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -605,7 +605,6 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
- "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

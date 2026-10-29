@@ -49,11 +49,10 @@ fn main() {
         let mut seq = 0u32;
         let t0 = Instant::now();
         let mut fake_now = t0;
-        let mut hop = [0f32; HOP];
         let mut out = [0f32; FRAME_SAMPLES];
         let mut cpu = Duration::ZERO;
-        for (i, c) in mix.chunks_exact(HOP).enumerate() {
-            hop.copy_from_slice(c);
+        for (i, c) in mix.as_chunks::<HOP>().0.iter().enumerate() {
+            let mut hop = *c;
             let t = Instant::now();
             chain.push_hop(&shared, &mut hop, &mut packets);
             cpu += t.elapsed();
@@ -77,26 +76,26 @@ fn main() {
             v[a..b].chunks(FRAME_SAMPLES).any(|c| dsp::rms(c) > thr)
         };
         let (mut sp, mut sp_sent, mut nz, mut nz_sent, mut sil, mut sil_sent) = (0, 0, 0, 0, 0, 0);
-        for f in 0..frames {
+        for (f, &sent) in sent_frames.iter().enumerate().take(frames) {
             let r = f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES;
             let s = dsp::rms(&speech[r.clone()]) > 0.02;
             let b = dsp::rms(&noise[r.clone()]) > 0.02;
             if s {
                 sp += 1;
-                sp_sent += sent_frames[f] as u32;
+                sp_sent += sent as u32;
             } else if b && !near(&speech, f, 0.005) {
                 nz += 1;
-                nz_sent += sent_frames[f] as u32;
+                nz_sent += sent as u32;
             } else if !b && !near(&speech, f, 0.005) {
                 sil += 1;
-                sil_sent += sent_frames[f] as u32;
+                sil_sent += sent as u32;
             }
         }
         // Cuts: gaps in transmission inside an utterance (sent before and after, within 1 s).
         let (mut cuts, mut cut_ms, mut run) = (0u32, 0u32, 0u32);
         let mut seen_sent = false;
-        for f in 0..frames {
-            if sent_frames[f] {
+        for &sent in &sent_frames[..frames] {
+            if sent {
                 if seen_sent && run > 0 && run < 50 {
                     cuts += 1;
                     cut_ms += run * 20;

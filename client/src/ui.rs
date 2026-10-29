@@ -163,7 +163,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("●").color(GREEN));
                     ui.label(RichText::new(server_name).strong());
-                    if let Some(p) = st.my_id.and_then(|id| st.users.get(&id)).and_then(|u| u.ping_ms) {
+                    if let Some(p) = st.me().and_then(|u| u.ping_ms) {
                         ui.label(RichText::new(format!("ping {p} ms")).weak());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

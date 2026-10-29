@@ -95,8 +95,12 @@ pub struct Status {
 }
 
 impl Status {
+    pub fn me(&self) -> Option<&UserView> {
+        self.my_id.and_then(|id| self.users.get(&id))
+    }
+
     pub fn my_name(&self) -> Option<&str> {
-        self.my_id.and_then(|id| self.users.get(&id)).map(|u| u.info.name.as_str())
+        self.me().map(|u| u.info.name.as_str())
     }
 }
 

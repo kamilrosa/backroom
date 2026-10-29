@@ -43,6 +43,11 @@ const SILENCE_RESTART_EVERY: Duration = Duration::from_secs(15);
 /// in the middle of a sentence (the sender's gate closed), so it is logged.
 const SHORT_GAP: Duration = Duration::from_millis(300);
 
+/// Whether something last done at `last` (`None` = never) is due again.
+fn due(last: Option<Instant>, every: Duration) -> bool {
+    last.is_none_or(|t| t.elapsed() >= every)
+}
+
 fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -77,11 +82,11 @@ fn default_device(host: &cpal::Host, dir: Dir) -> Option<cpal::Device> {
 
 /// The selected device or the default one. Second element: whether we follow
 /// the default device; third: a warning for the user.
-fn pick_device(host: &cpal::Host, dir: Dir, choice: &Option<String>) -> Option<(cpal::Device, bool, String)> {
+fn pick_device(host: &cpal::Host, dir: Dir, choice: Option<&str>) -> Option<(cpal::Device, bool, String)> {
     if let Some(name) = choice {
         let found = match dir {
-            Dir::Input => host.input_devices().ok().and_then(|mut d| d.find(|d| &device_name(d) == name)),
-            Dir::Output => host.output_devices().ok().and_then(|mut d| d.find(|d| &device_name(d) == name)),
+            Dir::Input => host.input_devices().ok().and_then(|mut d| d.find(|d| device_name(d) == name)),
+            Dir::Output => host.output_devices().ok().and_then(|mut d| d.find(|d| device_name(d) == name)),
         };
         if let Some(d) = found {
             return Some((d, false, String::new()));
@@ -227,7 +232,7 @@ where
 fn open_input(host: &cpal::Host, shared: &Shared) -> Result<OpenInput, String> {
     let gen = shared.device_gen.load(Ordering::Relaxed);
     let choice = shared.input_choice.lock().clone();
-    let (dev, follow, note) = pick_device(host, Dir::Input, &choice).ok_or("no microphone in the system")?;
+    let (dev, follow, note) = pick_device(host, Dir::Input, choice.as_deref()).ok_or("no microphone in the system")?;
     let (cfg, fmt) = stream_config(&dev, Dir::Input)?;
     let (prod, cons) = rtrb::RingBuffer::new(cfg.sample_rate as usize);
     let mut watch = Watch::new(device_name(&dev), follow, gen);
@@ -257,11 +262,11 @@ pub fn spawn_capture(
 fn capture_thread(shared: Arc<Shared>, voice_tx: tokio::sync::mpsc::Sender<Vec<u8>>, clip_tx: Sender<Vec<f32>>) {
     let host = cpal::default_host();
     let mut input: Option<OpenInput> = None;
-    let mut last_try = Instant::now() - RETRY_OPEN_EVERY;
+    let mut last_try = None;
     let mut last_watch = Instant::now();
     let mut last_default_check = Instant::now();
-    let mut last_list = Instant::now() - LIST_EVERY;
-    let mut last_silence_restart = Instant::now() - SILENCE_RESTART_EVERY;
+    let mut last_list = None;
+    let mut last_silence_restart = None;
 
     let mut chain = MicChain::new();
     if !chain.denoise_available() {
@@ -278,8 +283,8 @@ fn capture_thread(shared: Arc<Shared>, voice_tx: tokio::sync::mpsc::Sender<Vec<u
     let mut rec: Option<Recorder> = None;
 
     loop {
-        if input.is_none() && last_try.elapsed() >= RETRY_OPEN_EVERY {
-            last_try = Instant::now();
+        if input.is_none() && due(last_try, RETRY_OPEN_EVERY) {
+            last_try = Some(Instant::now());
             match open_input(&host, &shared) {
                 Ok(i) => {
                     resampler = Resampler::new(i.rate, 48_000);
@@ -331,8 +336,8 @@ fn capture_thread(shared: Arc<Shared>, voice_tx: tokio::sync::mpsc::Sender<Vec<u
                     s.input.message =
                         "The microphone is sending pure silence — muted in the system or missing permission?".into()
                 });
-                if last_silence_restart.elapsed() >= SILENCE_RESTART_EVERY {
-                    last_silence_restart = Instant::now();
+                if due(last_silence_restart, SILENCE_RESTART_EVERY) {
+                    last_silence_restart = Some(Instant::now());
                     reason = Some("microphone is sending pure silence".into());
                 }
             } else if zero_run.is_zero() && input.is_some() {
@@ -347,12 +352,12 @@ fn capture_thread(shared: Arc<Shared>, voice_tx: tokio::sync::mpsc::Sender<Vec<u
                 if let Some(old) = input.take() {
                     drop(old.stream);
                 }
-                last_try = Instant::now() - RETRY_OPEN_EVERY;
+                last_try = None; // reopen right away
                 // Any ongoing utterance gets cut — close it properly.
                 chain.force_close(&mut packets);
             }
-            if last_list.elapsed() >= LIST_EVERY {
-                last_list = Instant::now();
+            if due(last_list, LIST_EVERY) {
+                last_list = Some(Instant::now());
                 let list = list_devices(&host, Dir::Input);
                 shared.status.lock().input_devices = list;
             }
@@ -494,7 +499,7 @@ where
 fn open_output(host: &cpal::Host, shared: &Shared) -> Result<OpenOutput, String> {
     let gen = shared.device_gen.load(Ordering::Relaxed);
     let choice = shared.output_choice.lock().clone();
-    let (dev, follow, note) = pick_device(host, Dir::Output, &choice).ok_or("no speakers in the system")?;
+    let (dev, follow, note) = pick_device(host, Dir::Output, choice.as_deref()).ok_or("no speakers in the system")?;
     let (cfg, fmt) = stream_config(&dev, Dir::Output)?;
     let capacity = cfg.sample_rate as usize / 2; // 500 ms
     let (prod, cons) = rtrb::RingBuffer::new(capacity);
@@ -600,10 +605,10 @@ fn chime() -> Vec<f32> {
 fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receiver<Vec<f32>>) {
     let host = cpal::default_host();
     let mut output: Option<OpenOutput> = None;
-    let mut last_try = Instant::now() - RETRY_OPEN_EVERY;
+    let mut last_try = None;
     let mut last_watch = Instant::now();
     let mut last_default_check = Instant::now();
-    let mut last_list = Instant::now() - LIST_EVERY;
+    let mut last_list = None;
     let mut resampler = Resampler::new(48_000, 48_000);
     let mut peers: std::collections::HashMap<UserId, Peer> = Default::default();
     let mut mix = [0f32; FRAME_SAMPLES];
@@ -615,8 +620,8 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
     let mut chime_pos: Option<usize> = None;
 
     loop {
-        if output.is_none() && last_try.elapsed() >= RETRY_OPEN_EVERY {
-            last_try = Instant::now();
+        if output.is_none() && due(last_try, RETRY_OPEN_EVERY) {
+            last_try = Some(Instant::now());
             match open_output(&host, &shared) {
                 Ok(o) => {
                     resampler = Resampler::new(48_000, o.rate);
@@ -710,10 +715,10 @@ fn playback_thread(shared: Arc<Shared>, rx: Receiver<Incoming>, clip_rx: Receive
                 if let Some(old) = output.take() {
                     drop(old.stream);
                 }
-                last_try = Instant::now() - RETRY_OPEN_EVERY;
+                last_try = None; // reopen right away
             }
-            if last_list.elapsed() >= LIST_EVERY {
-                last_list = Instant::now();
+            if due(last_list, LIST_EVERY) {
+                last_list = Some(Instant::now());
                 let list = list_devices(&host, Dir::Output);
                 shared.status.lock().output_devices = list;
             }

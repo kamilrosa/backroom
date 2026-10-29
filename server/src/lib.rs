@@ -16,7 +16,6 @@ use bytes::Bytes;
 use backroom_proto::{self as proto, ChatLine, ClientMsg, ServerMsg, UserId, UserInfo};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -73,6 +72,73 @@ impl Room {
         }
     }
 
+    /// The same person after a dropped connection: the old session is a
+    /// "ghost" that has not timed out yet. Kick it instead of blocking the nickname.
+    fn kick_ghost(&mut self, name: &str) {
+        let ghost = self
+            .peers
+            .iter()
+            .find(|(_, p)| p.info.name.eq_ignore_ascii_case(name))
+            .map(|(id, _)| *id);
+        if let Some(old) = ghost.and_then(|id| self.peers.remove(&id)) {
+            old.conn.close(
+                proto::CLOSE_REPLACED.into(),
+                b"replaced by a new connection",
+            );
+            self.broadcast(&ServerMsg::Left { id: old.info.id }, None);
+            info!("{name}: replacing previous session #{}", old.info.id);
+        }
+    }
+
+    /// Adds a newcomer: sends them the room (and the recent chat) and tells
+    /// everyone else. `None` = the room is full.
+    fn join(
+        &mut self,
+        ctx: &Ctx,
+        name: &str,
+        conn: &quinn::Connection,
+        chat: bool,
+        tx: mpsc::UnboundedSender<ServerMsg>,
+    ) -> Option<UserId> {
+        self.kick_ghost(name);
+        if self.peers.len() >= ctx.max_users {
+            return None;
+        }
+        let id = self.alloc_id();
+        let info = UserInfo {
+            id,
+            name: name.to_string(),
+            muted: false,
+            deafened: false,
+            away: false,
+        };
+        let mut users: Vec<UserInfo> = self.peers.values().map(|p| p.info.clone()).collect();
+        users.push(info.clone());
+        users.sort_by_key(|u| u.id);
+        let _ = tx.send(ServerMsg::Welcome {
+            your_id: id,
+            server_name: ctx.name.clone(),
+            users,
+            features: vec![proto::FEATURE_CHAT.into()],
+        });
+        if chat {
+            for line in &self.history {
+                let _ = tx.send(ServerMsg::Chat { line: line.clone(), history: true });
+            }
+        }
+        self.broadcast(&ServerMsg::Joined { user: info.clone() }, None);
+        self.peers.insert(
+            id,
+            Peer {
+                info,
+                conn: conn.clone(),
+                tx,
+                chat,
+            },
+        );
+        Some(id)
+    }
+
     fn chat(&mut self, line: ChatLine) {
         let msg = ServerMsg::Chat { line: line.clone(), history: false };
         for p in self.peers.values().filter(|p| p.chat) {
@@ -118,7 +184,7 @@ impl Server {
 /// Starts the server on the current tokio runtime.
 pub fn start(s: Settings) -> Result<Server> {
     let (cert, key) = load_or_create_cert(&s.data_dir)?;
-    let fingerprint = fingerprint(&cert);
+    let fingerprint = proto::fingerprint(&cert);
     let endpoint = quinn::Endpoint::server(server_config(cert, key)?, s.bind)?;
     let addr = endpoint.local_addr()?;
 
@@ -209,14 +275,6 @@ fn load_or_create_cert(dir: &Path) -> Result<(CertificateDer<'static>, PrivateKe
     ))
 }
 
-fn fingerprint(cert: &[u8]) -> String {
-    let h = Sha256::digest(cert);
-    h.iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     buf: &mut Vec<u8>,
@@ -276,63 +334,7 @@ async fn handle(ctx: Arc<Ctx>, incoming: quinn::Incoming) -> Result<()> {
 
     let chat = features.iter().any(|f| f == proto::FEATURE_CHAT);
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
-    let joined = {
-        let mut room = ctx.room.lock().unwrap();
-        // The same person after a dropped connection: the old session is a
-        // "ghost" that has not timed out yet. Kick it instead of blocking the nickname.
-        let ghost = room
-            .peers
-            .iter()
-            .find(|(_, p)| p.info.name.eq_ignore_ascii_case(&name))
-            .map(|(id, _)| *id);
-        if let Some(gid) = ghost {
-            if let Some(old) = room.peers.remove(&gid) {
-                old.conn.close(
-                    proto::CLOSE_REPLACED.into(),
-                    b"replaced by a new connection",
-                );
-                room.broadcast(&ServerMsg::Left { id: gid }, None);
-                info!("{name}: replacing previous session #{gid}");
-            }
-        }
-        if room.peers.len() >= ctx.max_users {
-            None
-        } else {
-            let my_id = room.alloc_id();
-            let info = UserInfo {
-                id: my_id,
-                name: name.clone(),
-                muted: false,
-                deafened: false,
-                away: false,
-            };
-            let mut users: Vec<UserInfo> = room.peers.values().map(|p| p.info.clone()).collect();
-            users.push(info.clone());
-            users.sort_by_key(|u| u.id);
-            let _ = tx.send(ServerMsg::Welcome {
-                your_id: my_id,
-                server_name: ctx.name.clone(),
-                users,
-                features: vec![proto::FEATURE_CHAT.into()],
-            });
-            if chat {
-                for line in &room.history {
-                    let _ = tx.send(ServerMsg::Chat { line: line.clone(), history: true });
-                }
-            }
-            room.broadcast(&ServerMsg::Joined { user: info.clone() }, None);
-            room.peers.insert(
-                my_id,
-                Peer {
-                    info,
-                    conn: conn.clone(),
-                    tx,
-                    chat,
-                },
-            );
-            Some(my_id)
-        }
-    };
+    let joined = ctx.room.lock().unwrap().join(&ctx, &name, &conn, chat, tx);
     let Some(my_id) = joined else {
         return Err(reject(
             &mut send,
